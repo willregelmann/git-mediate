@@ -17,14 +17,15 @@ A Git extension to identify the source of merge conflicts before actually mergin
    git clone https://github.com/yourusername/git-mediate.git
    ```
 
-2. Make the script executable (if it's not already):
+2. Install using pip:
    ```
-   chmod +x git-mediate
+   cd git-mediate
+   pip install .
    ```
 
-3. Add the directory to your PATH, or link the script to a directory that's already in your PATH:
+   For development mode (changes to the code take effect immediately):
    ```
-   ln -s "$(pwd)/git-mediate" /usr/local/bin/git-mediate
+   pip install -e .
    ```
 
 Git automatically detects executables with names that start with `git-` and makes them available as subcommands. For example, `git-mediate` becomes accessible as `git mediate`.
@@ -47,22 +48,27 @@ This will analyze potential conflicts and show you the commits in the `main` bra
 
 ```
 Checking for conflicts between feature and main...
-Found 2 potential conflicting files.
 
-Analyzing conflicts in: src/app.js
-
-Conflicts would result from the following commits:
-
-f2fa059e406de7b61203c1c8df6fd71617b6fc18 Update error handling in API
+Update error handling in API
 Author: John Doe <john@example.com>
+Date: 2025-05-01 10:23:45
+SHA: f2fa059e406de7b61203c1c8df6fd71617b6fc18
 
-a8cd45f719f6ac7e4b287f98a9c9e1c83e7b5f12 Refactor main controller
+Refactor main controller
 Author: Jane Smith <jane@example.com>
+Date: 2025-05-02 14:37:22
+SHA: a8cd45f719f6ac7e4b287f98a9c9e1c83e7b5f12
 ```
 
 ## How It Works
 
-`git-mediate` simulates a merge operation without actually performing it, analyzes the conflicts that would occur, and uses `git blame` to identify the commits on the target branch that last modified the conflicting lines.
+`git-mediate` works without modifying your working directory:
+
+1. It identifies potential conflicts using Git's merge-tree command
+2. For each conflicting file, it determines which commits in the target branch 
+3. It presents this information in a clear format, showing:
+   - Which commits would cause conflicts
+   - When those changes were made and by whom
 
 ## Requirements
 
