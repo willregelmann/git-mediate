@@ -57,7 +57,7 @@ def find_conflicting_files_and_commits(source_branch: str, target_branch: str) -
         in_conflict_section = False
         
         for line in merge_tree_output.splitlines():
-            if line.startswith("changed in both"):
+            if line.startswith("changed in both") or line.startswith("added in both") or line.startswith("removed in both"):
                 in_conflict_section = True
                 continue
                 
