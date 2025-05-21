@@ -62,11 +62,12 @@ def find_conflicting_files_and_commits(source_branch: str, target_branch: str) -
                 continue
                 
             if in_conflict_section and line.startswith("  their"):
-                parts = line.strip().split()
-                if len(parts) > 3:
-                    current_file = parts[-1]
+                parts = line.strip().split(None, 3)
+                if len(parts) >= 4:
+                    current_file = parts[3]
                     conflict_files.append(current_file)
                     in_conflict_section = False
+                    logging.debug(f"Found conflict file: {current_file}")
         
         if not conflict_files:
             return {"commits": {}}
