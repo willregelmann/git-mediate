@@ -1,351 +1,364 @@
-#!/usr/bin/env python3
-"""
-git-mediate - A git extension to identify the source of merge conflicts.
-
-Usage: git mediate <target-branch>
-"""
-
 import argparse
-import re
 import subprocess
+import re
 import sys
-from typing import Dict, List, Any
-import logging
 
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
-
-def run_git_command(command: List[str]) -> str:
+def run_command(cmd):
+    """Run a command and return its output."""
     try:
         result = subprocess.run(
-            ["git"] + command,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        if e.stderr and "exit code 1" in e.stderr and not e.stdout:
-            return ""
-        print(f"Error running git command: {e.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-def get_current_branch() -> str:
-    return run_git_command(["rev-parse", "--abbrev-ref", "HEAD"])
-
-def get_merge_base(branch1: str, branch2: str) -> str:
-    return run_git_command(["merge-base", branch1, branch2])
-
-def find_conflicting_files_and_commits(source_branch: str, target_branch: str) -> Dict[str, Any]:
-    conflict_commits = {}
-    
-    try:
-        merge_base = get_merge_base(source_branch, target_branch)
-        logging.debug(f"Merge base for {source_branch} and {target_branch}: {merge_base}")
-        
-        merge_tree_cmd = ["git", "merge-tree", merge_base, source_branch, target_branch]
-        logging.debug(f"Running: git {' '.join(merge_tree_cmd)}")
-        merge_tree_process = subprocess.run(
-            merge_tree_cmd,
-            capture_output=True,
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             check=False
         )
-        merge_tree_output = merge_tree_process.stdout
-        
-        if not merge_tree_output:
-            logging.warning("merge-tree command produced no output")
-            return {"commits": {}}
-        
-        conflict_files = []
-        conflict_details = {}
-        
-        file_blocks = merge_tree_output.split("changed in both")
-        
-        for block in file_blocks[1:]:
-            lines = block.strip().split('\n')
-            if len(lines) < 3:
-                continue
-            
-            their_line = None
-            for line in lines[:3]:
-                if line.strip().startswith("their"):
-                    their_line = line
-                    break
-            
-            if not their_line:
-                continue
-                
-            parts = their_line.strip().split(None, 3)
-            if len(parts) < 4:
-                continue
-                
-            filepath = parts[3]
-            conflict_files.append(filepath)
-            logging.debug(f"Found conflict file: {filepath}")
-            
-            chunks = []
-            in_chunk = False
-            chunk_content = []
-            conflict_found = False
-            diff_line_map = {}
-            current_line = 0
-            
-            for line in lines:
-                if line.startswith("@@"):
-                    if in_chunk and chunk_content and conflict_found:
-                        chunks.append({
-                            "content": '\n'.join(chunk_content),
-                            "line_numbers": list(diff_line_map.keys())
-                        })
-                    
-                    chunk_content = [line]
-                    in_chunk = True
-                    conflict_found = False
-                    diff_line_map = {}
-                    
-                    try:
-                        hunk_header = line.split('@@')[1].strip()
-                        match = re.search(r'\+([0-9]+)(?:,([0-9]+))?', hunk_header)
-                        if match:
-                            current_line = int(match.group(1))
-                    except Exception as e:
-                        logging.debug(f"Error parsing hunk header: {str(e)}")
-                    continue
-                
-                if in_chunk:
-                    chunk_content.append(line)
-                    
-                    if "<<<<<<< .our" in line:
-                        conflict_found = True
-                        in_our_section = True
-                        in_their_section = False
-                    elif "=======" in line:
-                        in_our_section = False
-                        in_their_section = True
-                    elif ">>>>>>> .their" in line:
-                        in_our_section = False
-                        in_their_section = False
-                    elif not line.startswith("-"):
-                        if conflict_found:
-                            if in_our_section:
-                                diff_line_map[current_line] = {"side": "our", "content": line}
-                            elif in_their_section:
-                                diff_line_map[current_line] = {"side": "their", "content": line}
-                            else:
-                                pass
-                        current_line += 1
-            
-            if in_chunk and chunk_content and conflict_found:
-                chunks.append({
-                    "content": '\n'.join(chunk_content),
-                    "line_numbers": list(diff_line_map.keys())
-                })
-            
-            if chunks:
-                conflict_details[filepath] = chunks
-        
-        logging.debug(f"Found {len(conflict_details)} files with conflict chunks")
-        
-        for filepath, chunks in conflict_details.items():
-            logging.debug(f"Processing conflict file: {filepath} with {len(chunks)} conflict chunks")
-            
-            try:
-                exists_in_source = subprocess.run(
-                    ["git", "cat-file", "-e", f"{source_branch}:{filepath}"],
-                    stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    check=False
-                ).returncode == 0
-                
-                exists_in_target = subprocess.run(
-                    ["git", "cat-file", "-e", f"{target_branch}:{filepath}"],
-                    stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    check=False
-                ).returncode == 0
-                
-                if not (exists_in_source and exists_in_target):
-                    logging.debug(f"File '{filepath}' doesn't exist in both branches; source={exists_in_source}, target={exists_in_target}")
-                    continue
-                
-                source_commits_for_file = set()
-                target_commits_for_file = set()
-                
-                for chunk in chunks:
-                    if "line_numbers" in chunk and chunk["line_numbers"]:
-                        our_lines = []
-                        their_lines = []
-                        
-                        for line_num, line_info in diff_line_map.items():
-                            if isinstance(line_info, dict) and "side" in line_info:
-                                if line_info["side"] == "our":
-                                    our_lines.append(line_num)
-                                elif line_info["side"] == "their":
-                                    their_lines.append(line_num)
-                        
-                        logging.debug(f"Found {len(our_lines)} lines unique to our side and {len(their_lines)} lines unique to their side")
-                        
-                        for line_num in our_lines:
-                            try:
-                                source_blame = run_git_command(["blame", "-L", f"{line_num},{line_num}", source_branch, "--", filepath])
-                                if source_blame:
-                                    parts = source_blame.split(' ', 1)
-                                    if len(parts) > 0 and len(parts[0]) > 8:
-                                        commit_hash = parts[0].lstrip('^')
-                                        source_commits_for_file.add(commit_hash)
-                                        logging.debug(f"Source commit for conflicting line {line_num}: {commit_hash}")
-                            except Exception as e:
-                                logging.debug(f"Error getting blame for source line {line_num}: {str(e)}")
-                        
-                        for line_num in their_lines:
-                            try:
-                                target_blame = run_git_command(["blame", "-L", f"{line_num},{line_num}", target_branch, "--", filepath])
-                                if target_blame:
-                                    parts = target_blame.split(' ', 1)
-                                    if len(parts) > 0 and len(parts[0]) > 8:
-                                        commit_hash = parts[0].lstrip('^')
-                                        target_commits_for_file.add(commit_hash)
-                                        logging.debug(f"Target commit for conflicting line {line_num}: {commit_hash}")
-                            except Exception as e:
-                                logging.debug(f"Error getting blame for target line {line_num}: {str(e)}")
-                
-                if not (source_commits_for_file or target_commits_for_file):
-                    logging.debug(f"Could not identify specific commits for {filepath}, showing conflict chunk")
-                    for chunk in chunks:
-                        logging.debug(f"Conflict chunk:\n{chunk['content']}")
-                
-                for commit_hash in source_commits_for_file.union(target_commits_for_file):
-                    if commit_hash and commit_hash != merge_base and len(commit_hash) > 8:
-                        details = get_commit_details(commit_hash)
-                        if details:
-                            conflict_commits[commit_hash] = details
-                            logging.debug(f"Added conflicting commit: {commit_hash}")
-                
-            except Exception as e:
-                logging.debug(f"Error processing conflict in {filepath}: {str(e)}")
-        
-        return {"commits": conflict_commits, "files": list(conflict_details.keys())}
-            
-    except Exception as e:
-        error_msg = f"Error analyzing conflicts: {str(e)}"
-        print(error_msg)
-        logging.warning(error_msg)
-        return {"commits": {}}
-
-
-def get_commit_details(commit_hash: str) -> Dict:
-    clean_hash = commit_hash
-    if commit_hash.startswith('^'):
-        clean_hash = commit_hash[1:]
-    
-    logging.debug(f"Getting details for commit: {clean_hash}")
-    
-    try:
-        verify_cmd = ["git", "cat-file", "-e", clean_hash]
-        verify_result = subprocess.run(
-            verify_cmd,
-            stderr=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            check=False
-        )
-        
-        if verify_result.returncode != 0:
-            logging.debug(f"Commit {clean_hash} not found in repository")
+        if result.returncode != 0:
+            # For specific error cases, we might want to pass through stderr
+            if "not a git repository" in result.stderr.lower():
+                print(result.stderr, file=sys.stderr)
             return None
-        
-        commit_info = subprocess.run(
-            ["git", "show", "-s", "--format=%s%n%an <%ae>%n%ad", "--date=format:%Y-%m-%d %H:%M:%S", clean_hash],
+        return result.stdout.strip()
+    except Exception:
+        return None
+
+def get_current_branch():
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
-            check=True
+            check=False  # Don't raise exception
         )
-        
-        lines = commit_info.stdout.strip().split('\n')
-        
-        if len(lines) < 3:
-            logging.debug(f"Incomplete details for commit {clean_hash}")
-            return {
-                'subject': clean_hash[:8],
-                'author': 'Unknown',
-                'date': 'Unknown date',
-                'formatted_output': f"Commit: {clean_hash[:8]}\nDetails unavailable"
-            }
-        
-        subject = lines[0].strip()
-        if len(subject) > 80:
-            subject = subject[:77] + "..."
-            
-        result = {
-            'subject': subject,
-            'author': lines[1],
-            'date': lines[2],
-            'formatted_output': f"{subject}\nAuthor: {lines[1]}\nDate: {lines[2]}\nSHA: {clean_hash}"
-        }
-        
-        return result
-    except subprocess.CalledProcessError as e:
-        logging.debug(f"Error getting commit details: {str(e)}")
+        if result.returncode != 0:
+            # Pass through git error messages
+            if result.stderr and "not a git repository" in result.stderr.lower():
+                print(result.stderr, file=sys.stderr)
+            return None
+        return result.stdout.strip()
+    except Exception:
         return None
+
+def find_conflicting_files_and_content(source, target):
+    """Find files that would conflict and extract the conflicting content."""
+    # Get merge base
+    merge_base = run_command(["git", "merge-base", source, target])
+    if not merge_base:
+        print(f"Error: Cannot find merge base between {source} and {target}", file=sys.stderr)
+        return {}
+    
+    # Run merge-tree to find conflicts
+    merge_output = run_command(["git", "merge-tree", merge_base, source, target])
+    if not merge_output:
+        return {}
+    
+    # Parse merge-tree output to extract files and their conflicting content
+    conflicts = {}  # filename -> list of conflicting content from target branch
+    lines = merge_output.splitlines()
+    current_file = None
+    in_conflict = False
+    current_conflict_content = []
+    
+    for i, line in enumerate(lines):
+        # Look for conflict indicators and file names
+        if (line.startswith("added in both") or 
+            line.startswith("changed in both") or
+            line.startswith("both added") or
+            line.startswith("both modified")):
+            
+            # Look for filename in subsequent lines
+            for j in range(i + 1, min(i + 10, len(lines))):
+                next_line = lines[j]
+                if next_line.strip() and (next_line.startswith("  our") or next_line.startswith("  their")):
+                    parts = next_line.split()
+                    if len(parts) >= 4:
+                        filename = parts[-1]
+                        current_file = filename
+                        if filename not in conflicts:
+                            conflicts[filename] = []
+                        break
+        
+        # Parse conflict markers to extract target branch content
+        elif '+<<<<<<< .our' in line:
+            in_conflict = True
+            current_conflict_content = []
+            in_their_section = False
+        elif '+=======' in line and in_conflict:
+            # Now we're in the "their" section (target branch content)
+            in_their_section = True
+        elif '+>>>>>>> .their' in line and in_conflict:
+            # End of conflict, save the target content we collected
+            if current_file and current_conflict_content:
+                conflicts[current_file].extend(current_conflict_content)
+            in_conflict = False
+            in_their_section = False
+            current_conflict_content = []
+        elif in_conflict and in_their_section and line.startswith('+'):
+            # This is content from the target branch (after =======)
+            # Remove the '+' prefix to get actual content
+            actual_content = line[1:]  # Remove leading '+'
+            current_conflict_content.append(actual_content)
+    
+    return conflicts
+
+def get_commits_for_conflicting_lines(file_path, conflicting_content, target_branch, source_branch):
+    """Find commits that last modified the specific conflicting lines."""
+    if not conflicting_content:
+        return []
+    
+    # Get the file content from both branches to compare
+    target_file_content = run_command(["git", "show", f"{target_branch}:{file_path}"])
+    source_file_content = run_command(["git", "show", f"{source_branch}:{file_path}"])
+    
+    if not target_file_content or not source_file_content:
+        return []
+    
+    target_lines = target_file_content.splitlines()
+    source_lines = source_file_content.splitlines()
+    
+    # Find all line numbers that actually differ and match our conflicts
+    conflicting_line_numbers = []
+    conflict_lines_set = {line.strip() for line in conflicting_content if line.strip()}
+    
+    for line_num, target_line in enumerate(target_lines, 1):
+        target_line_stripped = target_line.strip()
+        if target_line_stripped in conflict_lines_set:
+            # Check if this line is actually different from source branch
+            corresponding_source_line = ""
+            if line_num <= len(source_lines):
+                corresponding_source_line = source_lines[line_num - 1].strip()
+            
+            # Only include if the line is actually different
+            if target_line_stripped != corresponding_source_line:
+                conflicting_line_numbers.append(line_num)
+    
+    if not conflicting_line_numbers:
+        return []
+    
+    # Batch blame operation - get blame for entire file once
+    blame_cmd = ["git", "blame", "--porcelain", target_branch, "--", file_path]
+    blame_output = run_command(blame_cmd)
+    
+    if not blame_output:
+        return []
+    
+    # Parse blame output to get commit for each line
+    line_to_commit = {}
+    current_commit = None
+    current_line_num = 0
+    
+    for line in blame_output.splitlines():
+        # Check if this line starts with a commit hash (first word is 40 hex chars)
+        parts = line.split()
+        if parts and len(parts[0]) == 40 and all(c in '0123456789abcdef' for c in parts[0]):
+            # This is a commit hash line (format: "hash original_line final_line num_lines")
+            current_commit = parts[0]
+        elif line.startswith('\t'):
+            # This is the actual file content line
+            current_line_num += 1
+            if current_line_num in conflicting_line_numbers:
+                line_to_commit[current_line_num] = current_commit
+    
+    # Get unique commits and filter out merge commits
+    blame_commits = set()
+    unique_commits = set(line_to_commit.values())
+    
+    # Batch check for merge commits
+    merge_commits = get_merge_commits_batch(unique_commits)
+    
+    # Batch check for commits that exist in source branch (shouldn't be blamed)
+    source_commits = get_commits_in_branch(unique_commits, source_branch)
+    
+    for commit in unique_commits:
+        if (commit and 
+            commit not in merge_commits and 
+            commit not in source_commits):
+            blame_commits.add(commit)
+    
+    return list(blame_commits)
+
+def get_merge_commits_batch(commit_hashes):
+    """Efficiently check which commits are merge commits using git rev-list."""
+    if not commit_hashes:
+        return set()
+    
+    # Use git rev-list --merges to efficiently find merge commits
+    # This is much faster than cat-file for checking merge status
+    commit_list = list(commit_hashes)
+    if not commit_list:
+        return set()
+    
+    try:
+        # Use git rev-list --merges to find which of these commits are merges
+        merge_check_cmd = ["git", "rev-list", "--merges"] + commit_list
+        merge_output = run_command(merge_check_cmd)
+        
+        if merge_output:
+            return set(merge_output.splitlines())
+        else:
+            return set()
+    except Exception:
+        # Fallback to individual checks if batch fails
+        merge_commits = set()
+        for commit in commit_hashes:
+            if is_merge_commit(commit):
+                merge_commits.add(commit)
+        return merge_commits
+
+def get_commits_in_branch(commit_hashes, branch):
+    """Efficiently check which commits exist in the given branch using git branch --contains."""
+    if not commit_hashes:
+        return set()
+    
+    commits_in_branch = set()
+    
+    # Use git branch --contains for each commit (most reliable method)
+    for commit in commit_hashes:
+        if not commit:
+            continue
+            
+        try:
+            # Check if the commit exists in the branch
+            check_cmd = ["git", "branch", "--contains", commit]
+            result = run_command(check_cmd)
+            
+            if result:
+                # Parse the branch list to see if our target branch is included
+                branches = [line.strip().lstrip('* ') for line in result.splitlines()]
+                if branch in branches:
+                    commits_in_branch.add(commit)
+                    
+        except Exception:
+            # If there's an error checking this commit, skip it
+            continue
+            
+    return commits_in_branch
+
+def is_merge_commit(commit_hash):
+    """Check if a commit is a merge commit."""
+    if not commit_hash:
+        return False
+    cat_file = run_command(["git", "cat-file", "-p", commit_hash])
+    if cat_file:
+        return cat_file.count("parent ") > 1
+    return False
+
+def get_commit_details(commit_hash):
+    """Get formatted commit details."""
+    if not commit_hash:
+        return None
+    
+    # Get commit details in a single command
+    format_str = "%s%n%an <%ae>%n%ad"
+    commit_info = run_command(["git", "log", "--format=" + format_str, "--date=iso", "-n", "1", commit_hash])
+    
+    if not commit_info:
+        return None
+    
+    lines = commit_info.splitlines()
+    if len(lines) < 3:
+        return None
+    
+    return {
+        "message": lines[0],
+        "author": lines[1], 
+        "date": lines[2],
+        "sha": commit_hash
+    }
+
+def get_commit_details_batch(commit_hashes):
+    """Get commit details for multiple commits in a single git command."""
+    if not commit_hashes:
+        return {}
+    
+    # Use git log with multiple commits
+    format_str = "COMMIT_START %H%n%s%n%an <%ae>%n%ad%nCOMMIT_END"
+    commit_list = list(commit_hashes)
+    
+    log_output = run_command(["git", "log", "--format=" + format_str, "--date=iso", "--no-walk"] + commit_list)
+    
+    if not log_output:
+        return {}
+    
+    # Parse the batch output
+    commit_details = {}
+    lines = log_output.splitlines()
+    i = 0
+    
+    while i < len(lines):
+        if lines[i].startswith("COMMIT_START "):
+            commit_hash = lines[i].split(" ", 1)[1]
+            if i + 4 < len(lines):
+                message = lines[i + 1]
+                author = lines[i + 2]
+                date = lines[i + 3]
+                
+                commit_details[commit_hash] = {
+                    "message": message,
+                    "author": author,
+                    "date": date,
+                    "sha": commit_hash
+                }
+                i += 5  # Skip to next commit
+            else:
+                break
+        else:
+            i += 1
+    
+    return commit_details
 
 def main():
     parser = argparse.ArgumentParser(description="Identify the source of merge conflicts before merging branches.")
-    parser.add_argument('target_branch', help="The branch to check for conflicts against")
-    parser.add_argument('-v', '--verbose', action='store_true', help="Show more detailed output including conflict chunks")
-    
-    if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(1)
-    
+    parser.add_argument('branch', help="The branch to check for conflicts against")
     args = parser.parse_args()
-    target_branch = args.target_branch
-    verbose = args.verbose
     
-    current_branch = get_current_branch()
+    if ".." in args.branch:
+        source_branch, target_branch = args.branch.split("..")
+    else:
+        source_branch = get_current_branch()
+        target_branch = args.branch
     
-    try:
-        subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-    except subprocess.CalledProcessError:
-        print("Error: Not in a Git repository")
-        sys.exit(1)
+    if not source_branch:
+        print("Error: Could not determine current branch", file=sys.stderr)
+        return 1
     
-    if current_branch == target_branch:
-        print(f"Error: Current branch and target branch are the same ({current_branch}).")
-        print("Please checkout a different branch or specify a different target branch.")
-        sys.exit(1)
+    print(f"Checking for conflicts between {source_branch} and {target_branch}...")
     
-    print(f"Checking for conflicts between {current_branch} and {target_branch}...")
+    # Find files with conflicts and their conflicting content
+    conflicts = find_conflicting_files_and_content(source_branch, target_branch)
     
-    result = find_conflicting_files_and_commits(current_branch, target_branch)
-    conflict_commits = result.get("commits", {})
-    conflict_files = result.get("files", [])
+    if not conflicts:
+        print("No conflicts found.")
+        return 0
     
-    valid_commits = {k: v for k, v in conflict_commits.items() if v is not None}
+    # Find commits that modified the specific conflicting lines
+    all_commit_hashes = set()
     
-    if not conflict_files:
-        print("No conflicts detected.")
-        sys.exit(0)
+    # Collect all commits first
+    for file_path, conflicting_content in conflicts.items():
+        commit_hashes = get_commits_for_conflicting_lines(file_path, conflicting_content, target_branch, source_branch)
+        all_commit_hashes.update(commit_hashes)
     
-    print("\nConflicts found in the following files:")
-    for filepath in conflict_files:
-        print(f"  - {filepath}")
+    # Batch get commit details for all unique commits
+    conflict_commits = get_commit_details_batch(all_commit_hashes)
     
-    if valid_commits:
-        print("\nCommits causing these conflicts:")
-        for commit_hash, details in valid_commits.items():
-            print(f"\n{details['formatted_output']}")
+    # Print results
+    print(f"\nConflicts found in the following files:")
+    for file_path in conflicts.keys():
+        print(f"  - {file_path}")
+    
+    if conflict_commits:
+        print("\nThe following commits likely cause conflicts:\n")
+        for commit in conflict_commits.values():
+            print(f"{commit['message']}")
+            print(f"Author: {commit['author']}")
+            print(f"Date: {commit['date']}")
+            print(f"SHA: {commit['sha']}")
+            print()
     else:
         print("\nCould not identify the specific commits causing these conflicts.")
-        print("This could be due to complex merge history or very old commits.")
     
-    try:
-        subprocess.run(["git", "merge", "--abort"], check=False, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    except:
-        pass
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
