@@ -116,14 +116,14 @@ def find_conflicting_files_and_content(source, target):
 def get_commits_for_conflicting_lines(file_path, conflicting_content, target_branch, source_branch):
     """Find commits that last modified the specific conflicting lines."""
     
-    # Strategy 1: If we have specific conflicting content, try to find the exact lines
+    # Only try to find commits for specific conflicting lines
+    # Don't fall back to showing all file changes if we can't find specific lines
     if conflicting_content:
         commits = find_commits_for_specific_lines(file_path, conflicting_content, target_branch, source_branch)
-        if commits:
-            return commits
+        return commits
     
-    # Strategy 2: Fallback - find recent commits that modified this file and aren't in source branch
-    return find_commits_for_file_changes(file_path, target_branch, source_branch)
+    # If no conflicting content found, return empty list instead of all file commits
+    return []
 
 def find_commits_for_specific_lines(file_path, conflicting_content, target_branch, source_branch):
     """Find commits for specific conflicting lines."""
@@ -135,30 +135,18 @@ def find_commits_for_specific_lines(file_path, conflicting_content, target_branc
     
     target_lines = target_file_content.splitlines()
     
-    # Find line numbers that match our conflicting content
-    conflicting_line_numbers = []
+    # Find line numbers that match our conflicting content - only exact matches
+    conflicting_line_numbers = set()
     
-    # Handle exact matches first
-    conflict_lines_set = {line.strip() for line in conflicting_content if line.strip()}
+    # Only use exact line matches (normalized for whitespace)
+    conflict_lines_normalized = [line.strip() for line in conflicting_content if line.strip() and len(line.strip()) > 5]
     
     for line_num, target_line in enumerate(target_lines, 1):
-        target_line_stripped = target_line.strip()
-        if target_line_stripped in conflict_lines_set:
-            conflicting_line_numbers.append(line_num)
+        target_line_normalized = target_line.strip()
+        if target_line_normalized and target_line_normalized in conflict_lines_normalized:
+            conflicting_line_numbers.add(line_num)
     
-    # If no exact matches, try fuzzy matching for imports and function definitions
-    if not conflicting_line_numbers:
-        for line_num, target_line in enumerate(target_lines, 1):
-            target_line_stripped = target_line.strip()
-            for conflict_line in conflicting_content:
-                conflict_line_stripped = conflict_line.strip()
-                # Match imports with partial content
-                if (conflict_line_stripped and 
-                    ('import' in conflict_line_stripped or 'function' in conflict_line_stripped) and
-                    any(word in target_line_stripped for word in conflict_line_stripped.split() if len(word) > 3)):
-                    conflicting_line_numbers.append(line_num)
-                    break
-    
+    # If no exact matches, return empty list - be very conservative
     if not conflicting_line_numbers:
         return []
     
@@ -184,8 +172,13 @@ def find_commits_for_specific_lines(file_path, conflicting_content, target_branc
             if current_line_num in conflicting_line_numbers:
                 line_to_commit[current_line_num] = current_commit
     
-    # Filter commits
-    return filter_blame_commits(set(line_to_commit.values()), source_branch)
+    # Only return unique commits that actually touched conflicting lines
+    unique_commits = set(line_to_commit.values())
+    if None in unique_commits:
+        unique_commits.remove(None)
+    
+    # Filter commits to exclude merge commits and commits already in source branch
+    return filter_blame_commits(unique_commits, source_branch)
 
 def find_commits_for_file_changes(file_path, target_branch, source_branch):
     """Fallback: Find recent commits that modified this file."""
@@ -382,6 +375,8 @@ def main():
     
     # Collect all commits first
     for file_path, conflicting_content in conflicts.items():
+        if not conflicting_content:
+            continue
         commit_hashes = get_commits_for_conflicting_lines(file_path, conflicting_content, target_branch, source_branch)
         all_commit_hashes.update(commit_hashes)
     
