@@ -4,6 +4,14 @@ import subprocess
 import re
 import sys
 
+# Global debug flag
+DEBUG = False
+
+def debug_print(message):
+    """Print debug message if debug mode is enabled."""
+    if DEBUG:
+        print(f"DEBUG: {message}", file=sys.stderr)
+
 def run_command(cmd):
     """Run a command and return its output."""
     try:
@@ -47,6 +55,122 @@ def get_current_branch():
     except Exception:
         return None
 
+def parse_new_merge_tree_output(output):
+    """Parse output from git merge-tree --write-tree format."""
+    conflicts = {}
+    lines = output.splitlines()
+    
+    current_file = None
+    in_conflict = False
+    current_conflict_content = []
+    in_their_section = False
+    
+    for line in lines:
+        # Look for conflict markers in the new format
+        if line.startswith("<<<<<<< "):
+            in_conflict = True
+            in_their_section = False
+            current_conflict_content = []
+        elif line.startswith("=======") and in_conflict:
+            in_their_section = True
+        elif line.startswith(">>>>>>> ") and in_conflict:
+            # Extract filename from the line before the conflict started
+            if current_file and current_conflict_content:
+                if current_file not in conflicts:
+                    conflicts[current_file] = []
+                conflicts[current_file].extend(current_conflict_content)
+            in_conflict = False
+            in_their_section = False
+            current_conflict_content = []
+        elif in_conflict and in_their_section:
+            current_conflict_content.append(line)
+        elif not in_conflict and line.strip():
+            # Track potential filename
+            if "/" in line and not line.startswith(" "):
+                current_file = line.strip()
+    
+    return conflicts
+
+def find_actual_conflict_lines(filename, source, target, merge_base):
+    """Find the actual lines that conflict between source and target branches."""
+    
+    # Get the file content from all three versions
+    source_content = run_command(["git", "show", f"{source}:{filename}"])
+    target_content = run_command(["git", "show", f"{target}:{filename}"])
+    base_content = run_command(["git", "show", f"{merge_base}:{filename}"])
+    
+    if not source_content or not target_content or not base_content:
+        return []
+    
+    source_lines = source_content.splitlines()
+    target_lines = target_content.splitlines()
+    base_lines = base_content.splitlines()
+    
+    # Find lines that were modified in both branches compared to the base
+    # These are the lines that would conflict
+    conflict_lines = []
+    max_lines = max(len(source_lines), len(target_lines), len(base_lines))
+    
+    for i in range(max_lines):
+        source_line = source_lines[i] if i < len(source_lines) else ""
+        target_line = target_lines[i] if i < len(target_lines) else ""
+        base_line = base_lines[i] if i < len(base_lines) else ""
+        
+        # Check if this line was modified in both branches
+        source_modified = source_line != base_line
+        target_modified = target_line != base_line
+        
+        # If both branches modified this line AND they modified it differently, it's a conflict
+        if source_modified and target_modified and source_line != target_line:
+            if target_line.strip():  # Only add non-empty lines
+                conflict_lines.append(target_line)
+    
+    return conflict_lines
+
+def parse_diff_changes(diff_output):
+    """Parse diff output to extract changed line ranges."""
+    changes = []
+    
+    for line in diff_output.splitlines():
+        if line.startswith("@@"):
+            # Parse hunk header like @@ -10,5 +10,7 @@
+            parts = line.split()
+            if len(parts) >= 3:
+                # Get the + part (new file)
+                plus_part = parts[2]
+                if plus_part.startswith("+"):
+                    nums = plus_part[1:].split(",")
+                    start = int(nums[0])
+                    count = int(nums[1]) if len(nums) > 1 else 1
+                    if count > 0:
+                        changes.append((start, count))
+    
+    return changes
+
+def parse_diff_for_line_numbers(diff_output):
+    """Parse git diff output to extract changed line numbers."""
+    changes = []
+    
+    for line in diff_output.splitlines():
+        # Look for hunk headers like @@ -1,3 +1,3 @@
+        if line.startswith("@@"):
+            parts = line.split()
+            if len(parts) >= 3:
+                # Parse the +line,count part
+                plus_part = parts[2]
+                if plus_part.startswith("+"):
+                    nums = plus_part[1:].split(",")
+                    start_line = int(nums[0])
+                    if len(nums) > 1:
+                        count = int(nums[1])
+                    else:
+                        count = 1
+                    
+                    if count > 0:  # Only add if there are actual changes
+                        changes.append((start_line, start_line + count - 1))
+    
+    return changes
+
 def find_conflicting_files_and_content(source, target):
     """Find files that would conflict and extract the conflicting content."""
     # Get merge base
@@ -55,11 +179,61 @@ def find_conflicting_files_and_content(source, target):
         print(f"Error: Cannot find merge base between {source} and {target}", file=sys.stderr)
         return {}
     
-    # Run merge-tree to find conflicts
+    # Try new merge-tree format first (Git 2.38+)
+    # Run with stderr captured to check for conflicts
+    try:
+        env = os.environ.copy()
+        env['GIT_CONFIG_GLOBAL'] = '/dev/null'
+        env['GIT_CONFIG_SYSTEM'] = '/dev/null'
+        
+        result = subprocess.run(
+            ["git", "merge-tree", "--write-tree", source, target],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Redirect stderr to stdout
+            text=True,
+            check=False,
+            env=env
+        )
+        
+        # Check if there are conflicts in the output
+        if result.returncode == 1 and result.stdout:
+            # Parse conflict files from output
+            conflicts = {}
+            for line in result.stdout.splitlines():
+                if "CONFLICT (content):" in line and "Merge conflict in" in line:
+                    # Extract filename
+                    parts = line.split("Merge conflict in ")
+                    if len(parts) > 1:
+                        filename = parts[1].strip()
+                        conflicts[filename] = []
+                elif line.startswith("100644 ") and "\t" in line:
+                    # This is a conflict entry in the new format
+                    # Format: 100644 <hash> <stage>\t<filename>
+                    parts = line.split("\t", 1)
+                    if len(parts) > 1:
+                        filename = parts[1].strip()
+                        if filename not in conflicts:
+                            conflicts[filename] = []
+            
+            # If we found conflicts, get the actual conflict content
+            if conflicts:
+                # Extract actual conflict content for each file
+                for filename in list(conflicts.keys()):
+                    conflict_content = find_actual_conflict_lines(filename, source, target, merge_base)
+                    conflicts[filename] = conflict_content
+                return conflicts
+    except Exception as e:
+        pass
+    
+    # Fall back to old merge-tree format
     merge_output = run_command(["git", "merge-tree", merge_base, source, target])
     if not merge_output:
         return {}
     
+    return parse_old_merge_tree_output(merge_output)
+
+def parse_old_merge_tree_output(merge_output):
+    """Parse the old format merge-tree output."""
     # Parse merge-tree output to extract files and their conflicting content
     conflicts = {}  # filename -> list of conflicting content from target branch
     lines = merge_output.splitlines()
@@ -116,46 +290,87 @@ def find_conflicting_files_and_content(source, target):
 def get_commits_for_conflicting_lines(file_path, conflicting_content, target_branch, source_branch):
     """Find commits that last modified the specific conflicting lines."""
     
-    # Only try to find commits for specific conflicting lines
-    # Don't fall back to showing all file changes if we can't find specific lines
+    # If we have specific conflicting content, use it
     if conflicting_content:
         commits = find_commits_for_specific_lines(file_path, conflicting_content, target_branch, source_branch)
         return commits
     
-    # If no conflicting content found, return empty list instead of all file commits
+    # No fallback - if we can't find specific conflicting lines, return empty
     return []
 
 def find_commits_for_specific_lines(file_path, conflicting_content, target_branch, source_branch):
-    """Find commits for specific conflicting lines."""
+    """Find commits that caused lines to diverge between branches."""
     
-    # Get the file content from target branch
+    debug_print(f"Finding commits for {len(conflicting_content)} conflicting lines in {file_path}")
+    
+    # Get the file content from both branches
     target_file_content = run_command(["git", "show", f"{target_branch}:{file_path}"])
-    if not target_file_content:
+    source_file_content = run_command(["git", "show", f"{source_branch}:{file_path}"])
+    
+    if not target_file_content or not source_file_content:
+        debug_print("Could not get file content from both branches")
         return []
     
     target_lines = target_file_content.splitlines()
+    source_lines = source_file_content.splitlines()
     
-    # Find line numbers that match our conflicting content - only exact matches
+    # Find line numbers that match our conflicting content in target branch
     conflicting_line_numbers = set()
     
     # Only use exact line matches (normalized for whitespace)
     conflict_lines_normalized = [line.strip() for line in conflicting_content if line.strip() and len(line.strip()) > 5]
+    debug_print(f"Looking for {len(conflict_lines_normalized)} normalized conflict lines")
     
     for line_num, target_line in enumerate(target_lines, 1):
         target_line_normalized = target_line.strip()
         if target_line_normalized and target_line_normalized in conflict_lines_normalized:
             conflicting_line_numbers.add(line_num)
+            debug_print(f"Found conflict line at line {line_num}: {target_line_normalized}")
     
     # If no exact matches, return empty list - be very conservative
     if not conflicting_line_numbers:
+        debug_print("No conflicting line numbers found")
         return []
     
-    # Get blame information for these lines
-    blame_cmd = ["git", "blame", "--porcelain", target_branch, "--", file_path]
+    debug_print(f"Found {len(conflicting_line_numbers)} conflicting line numbers: {conflicting_line_numbers}")
+    
+    # Get blame information for these lines in both branches
+    target_blame = get_blame_for_lines(file_path, target_branch, conflicting_line_numbers)
+    source_blame = get_blame_for_lines(file_path, source_branch, conflicting_line_numbers)
+    
+    debug_print(f"Target blame: {target_blame}")
+    debug_print(f"Source blame: {source_blame}")
+    
+    # Find commits that are different between branches
+    divergent_commits = set()
+    
+    for line_num in conflicting_line_numbers:
+        target_commit = target_blame.get(line_num)
+        source_commit = source_blame.get(line_num)
+        
+        debug_print(f"Line {line_num}: target={target_commit}, source={source_commit}")
+        
+        # If the commits are different, both branches modified this line differently
+        if target_commit and source_commit and target_commit != source_commit:
+            # Add the commit from the target branch (the one being merged)
+            divergent_commits.add(target_commit)
+            debug_print(f"Added divergent commit: {target_commit}")
+    
+    debug_print(f"Found {len(divergent_commits)} divergent commits before filtering")
+    
+    # Filter commits to exclude only merge commits (not branch existence)
+    filtered_commits = filter_merge_commits_only(divergent_commits)
+    debug_print(f"After filtering: {len(filtered_commits)} commits remain")
+    
+    return filtered_commits
+
+def get_blame_for_lines(file_path, branch, line_numbers):
+    """Get blame information for specific lines in a branch."""
+    blame_cmd = ["git", "blame", "--porcelain", branch, "--", file_path]
     blame_output = run_command(blame_cmd)
     
     if not blame_output:
-        return []
+        return {}
     
     # Parse blame output to get commit for each line
     line_to_commit = {}
@@ -169,22 +384,30 @@ def find_commits_for_specific_lines(file_path, conflicting_content, target_branc
             current_commit = parts[0]
         elif line.startswith('\t'):
             current_line_num += 1
-            if current_line_num in conflicting_line_numbers:
+            if current_line_num in line_numbers:
                 line_to_commit[current_line_num] = current_commit
     
-    # Only return unique commits that actually touched conflicting lines
-    unique_commits = set(line_to_commit.values())
-    if None in unique_commits:
-        unique_commits.remove(None)
-    
-    # Filter commits to exclude merge commits and commits already in source branch
-    return filter_blame_commits(unique_commits, source_branch)
+    return line_to_commit
 
 def find_commits_for_file_changes(file_path, target_branch, source_branch):
     """Fallback: Find recent commits that modified this file."""
     
-    # Get commits that modified this file in target branch but not in source branch
-    log_cmd = ["git", "log", "--format=%H", f"{source_branch}..{target_branch}", "--", file_path]
+    # Get the merge base
+    merge_base = run_command(["git", "merge-base", source_branch, target_branch])
+    if not merge_base:
+        return []
+    
+    # Get the diff between merge base and both branches to find conflicting hunks
+    source_diff = run_command(["git", "diff", "--name-only", merge_base, source_branch, "--", file_path])
+    target_diff = run_command(["git", "diff", "--name-only", merge_base, target_branch, "--", file_path])
+    
+    # Only proceed if both branches modified the file
+    if not source_diff or not target_diff:
+        return []
+    
+    # Use git log with -L to find commits that modified specific parts of the file
+    # First, let's get just the 2 most recent commits that modified this file
+    log_cmd = ["git", "log", "--format=%H", "-n", "2", f"{source_branch}..{target_branch}", "--", file_path]
     log_output = run_command(log_cmd)
     
     if not log_output:
@@ -215,6 +438,21 @@ def filter_blame_commits(commit_set, source_branch):
             blame_commits.add(commit)
     
     return list(blame_commits)
+
+def filter_merge_commits_only(commit_set):
+    """Filter out only merge commits, keep all others regardless of branch existence."""
+    if not commit_set:
+        return []
+    
+    # Batch check for merge commits
+    merge_commits = get_merge_commits_batch(commit_set)
+    
+    filtered_commits = []
+    for commit in commit_set:
+        if commit and commit not in merge_commits:
+            filtered_commits.append(commit)
+    
+    return filtered_commits
 
 def get_merge_commits_batch(commit_hashes):
     """Efficiently check which commits are merge commits using git rev-list."""
@@ -349,7 +587,12 @@ def get_commit_details_batch(commit_hashes):
 def main():
     parser = argparse.ArgumentParser(description="Identify the source of merge conflicts before merging branches.")
     parser.add_argument('branch', help="The branch to check for conflicts against")
+    parser.add_argument('--debug', action='store_true', help="Enable debug output")
     args = parser.parse_args()
+    
+    # Set global debug flag
+    global DEBUG
+    DEBUG = args.debug
     
     if ".." in args.branch:
         source_branch, target_branch = args.branch.split("..")
@@ -375,8 +618,6 @@ def main():
     
     # Collect all commits first
     for file_path, conflicting_content in conflicts.items():
-        if not conflicting_content:
-            continue
         commit_hashes = get_commits_for_conflicting_lines(file_path, conflicting_content, target_branch, source_branch)
         all_commit_hashes.update(commit_hashes)
     
