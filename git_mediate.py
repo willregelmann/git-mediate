@@ -457,15 +457,16 @@ def find_conflict_sources(source, target):
 # ---------------------------------------------------------------------------
 
 def get_commit_info(commit_hash):
-    output = git('log', '--format=%s%n%an <%ae>%n%ad', '--date=iso', '-n', '1', commit_hash)
+    output = git('log', '--format=%s%n%an <%ae>%n%ad%n%h', '--date=iso', '-n', '1', commit_hash)
     if not output:
         return None
     lines = output.splitlines()
     return {
-        'sha':     commit_hash,
-        'message': lines[0] if len(lines) > 0 else '',
-        'author':  lines[1] if len(lines) > 1 else '',
-        'date':    lines[2] if len(lines) > 2 else '',
+        'sha':       commit_hash,
+        'sha_short': lines[3] if len(lines) > 3 else commit_hash[:7],
+        'message':   lines[0] if len(lines) > 0 else '',
+        'author':    lines[1] if len(lines) > 1 else '',
+        'date':      lines[2] if len(lines) > 2 else '',
     }
 
 
@@ -501,7 +502,7 @@ def main():
             print("Error: could not determine current branch", file=sys.stderr)
             return 1
 
-    print(f"Checking for conflicts: merging {source} into {target}...")
+    debug(f"Checking for conflicts: merging {source} into {target}...")
 
     results = find_conflict_sources(source, target)
     if not results:
@@ -524,7 +525,7 @@ def main():
         print(info['message'])
         print(f"Author: {info['author']}")
         print(f"Date:   {info['date']}")
-        print(f"SHA:    {info['sha']}")
+        print(f"SHA:    {info['sha_short']}")
         print()
 
     return 0
