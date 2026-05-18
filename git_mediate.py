@@ -69,157 +69,52 @@ def git_combined(*args):
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Detect conflicting files
+# Step 1 — Run merge-tree and capture tree SHA + conflicting files
 # ---------------------------------------------------------------------------
 
-def find_conflicting_files(source, target):
+def run_merge_tree(source, target):
     """
-    Return the set of file paths that would have content conflicts when
-    merging source into target.  Requires Git 2.38+.
+    Run git merge-tree --write-tree and return (tree_sha, conflicting_files).
+    tree_sha is the SHA of the merged tree written by git (contains files with
+    conflict markers for conflicting paths).  Returns (None, set()) on a clean merge.
+    Requires Git 2.38+.
     """
     returncode, output = git_combined('merge-tree', '--write-tree', source, target)
     if returncode == 0:
-        return set()
+        return None, set()
+
+    lines = output.splitlines()
+    tree_sha = lines[0].strip() if lines else None
 
     files = set()
-    for line in output.splitlines():
+    for line in lines[1:]:
         if 'CONFLICT (content):' in line and 'Merge conflict in' in line:
             filename = line.split('Merge conflict in ', 1)[1].strip()
             files.add(filename)
 
+    debug(f"Merge tree SHA: {tree_sha[:8] if tree_sha else 'none'}")
     debug(f"Conflicting files: {files or 'none'}")
-    return files
-
-
-# ---------------------------------------------------------------------------
-# Step 2 — Diff hunk parsing and overlap detection
-# ---------------------------------------------------------------------------
-
-def parse_diff_hunks(diff_output):
-    """
-    Parse unified diff output into hunk tuples: (base_start, base_end, new_start, new_end).
-
-    Ranges are inclusive.  A count of 0 makes end < start:
-      base_end < base_start  →  pure insertion into base (no base lines consumed)
-      new_end  < new_start   →  pure deletion (no lines appear in the new file)
-    """
-    hunks = []
-    for line in diff_output.splitlines():
-        if not line.startswith('@@'):
-            continue
-        m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
-        if not m:
-            continue
-        base_start = int(m.group(1))
-        base_count = int(m.group(2)) if m.group(2) is not None else 1
-        new_start  = int(m.group(3))
-        new_count  = int(m.group(4)) if m.group(4) is not None else 1
-        hunks.append((
-            base_start, base_start + base_count - 1,
-            new_start,  new_start  + new_count  - 1,
-        ))
-    return hunks
-
-
-def hunks_overlap(a_bs, a_be, b_bs, b_be):
-    """
-    True if two hunk base-coordinate ranges overlap.
-
-    Handles pure-insertion ranges (end < start).  An insertion at position N
-    sits between lines N-1 and N of the base.  Two insertions at the same
-    point conflict; an insertion that falls inside a modification range also
-    conflicts.
-    """
-    a_insert = a_be < a_bs
-    b_insert = b_be < b_bs
-
-    if a_insert and b_insert:
-        return a_bs == b_bs           # same insertion point
-    if a_insert:
-        return b_bs <= a_bs <= b_be   # insertion falls inside b's range
-    if b_insert:
-        return a_bs <= b_bs <= a_be   # insertion falls inside a's range
-    return a_bs <= b_be and b_bs <= a_be  # standard interval overlap
+    return tree_sha, files
 
 
 # ---------------------------------------------------------------------------
 # Step 3 — Map conflicting regions to target branch line numbers
 # ---------------------------------------------------------------------------
 
-def get_conflicting_target_ranges(source, target, merge_base, filepath):
+def get_conflicting_target_ranges(tree_sha, filepath):
     """
-    For a file known to produce a content conflict, return:
-
-      modified_ranges  [(new_start, new_end), ...]
-          Line ranges in TARGET that are in actual textual conflict.
-          Determined via git merge-file so that hunks both branches changed to
-          the *same* value are not falsely included.
-
-      deleted_ranges   [(base_start, base_end), ...]
-          Base-coordinate ranges that TARGET deleted and SOURCE also modified.
-          These produce no lines in target, so merge-file won't surface them;
-          found via hunk overlap on the base diffs.
+    Read the file with conflict markers from the merge-tree result tree and
+    return line ranges (1-indexed, inclusive) in 'theirs' (target) that are
+    in conflict.  Returns (ranges, []) to keep the call-site signature stable.
     """
-    source_content = git('show', f'{source}:{filepath}')
-    target_content = git('show', f'{target}:{filepath}')
-    base_content   = git('show', f'{merge_base}:{filepath}') or ''
-
-    if source_content is None or target_content is None:
-        debug(f"  {filepath}: could not retrieve file content")
+    merged_content = git('show', f'{tree_sha}:{filepath}')
+    if merged_content is None:
+        debug(f"  {filepath}: could not read merged content from merge-tree result")
         return [], []
 
-    modified_ranges = _merge_file_conflict_ranges_in_theirs(
-        source_content, base_content, target_content
-    )
-    debug(f"  {filepath}: merge-file conflict ranges in target = {modified_ranges}")
-
-    deleted_ranges = _deleted_ranges_by_hunk_overlap(source, target, merge_base, filepath)
-    debug(f"  {filepath}: deleted ranges (base coords) = {deleted_ranges}")
-
-    return modified_ranges, deleted_ranges
-
-
-def _merge_file_conflict_ranges_in_theirs(ours_content, base_content, theirs_content):
-    """
-    Run git merge-file -p (ours=source, base=merge_base, theirs=target) and return
-    the line-number ranges (1-indexed, inclusive) in 'theirs' that appear inside
-    conflict sections of the merged output.
-
-    Theirs line numbers are tracked by counting all lines that are not in 'ours'
-    sections (both non-conflicting lines and theirs-section lines advance the counter).
-    """
-    import tempfile
-
-    paths = []
-    try:
-        for content, suffix in [
-            (ours_content,   '_ours'),
-            (base_content,   '_base'),
-            (theirs_content, '_theirs'),
-        ]:
-            data = content.encode('utf-8', errors='replace') if isinstance(content, str) else content
-            with tempfile.NamedTemporaryFile(mode='wb', suffix=suffix, delete=False) as f:
-                f.write(data)
-                paths.append(f.name)
-
-        result = subprocess.run(
-            ['git', 'merge-file', '-p'] + paths,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_git_env(),
-        )
-
-        if result.returncode != 1:
-            # 0 = clean merge, other non-1 = error (e.g. binary); no conflict ranges
-            return []
-
-        merged = result.stdout.decode('utf-8', errors='replace')
-        return _parse_theirs_conflict_ranges(merged)
-
-    finally:
-        for p in paths:
-            if os.path.exists(p):
-                os.unlink(p)
+    ranges = _parse_theirs_conflict_ranges(merged_content)
+    debug(f"  {filepath}: merge-tree conflict ranges in target = {ranges}")
+    return ranges, []
 
 
 def _parse_theirs_conflict_ranges(merged_text):
@@ -253,31 +148,6 @@ def _parse_theirs_conflict_ranges(merged_text):
 
     return ranges
 
-
-def _deleted_ranges_by_hunk_overlap(source, target, merge_base, filepath):
-    """
-    Find base-coordinate line ranges that target DELETED and source also modified.
-    """
-    source_diff = git('diff', '-U0', merge_base, source, '--', filepath)
-    target_diff = git('diff', '-U0', merge_base, target, '--', filepath)
-
-    if not source_diff or not target_diff:
-        return []
-
-    source_hunks = parse_diff_hunks(source_diff)
-    target_hunks = parse_diff_hunks(target_diff)
-
-    deleted = []
-    for t_bs, t_be, t_ns, t_ne in target_hunks:
-        if t_ne >= t_ns:          # not a pure deletion — merge-file handles these
-            continue
-        for s_bs, s_be, _, _ in source_hunks:
-            if hunks_overlap(t_bs, t_be, s_bs, s_be):
-                debug(f"    deleted overlap: base [{t_bs},{t_be}] deleted by target")
-                deleted.append((t_bs, t_be))
-                break
-
-    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -414,16 +284,14 @@ def find_conflict_sources(source, target):
         return {}
     debug(f"Merge base: {merge_base[:8]}")
 
-    conflicting_files = find_conflicting_files(source, target)
+    tree_sha, conflicting_files = run_merge_tree(source, target)
     if not conflicting_files:
         return {}
 
     results = {}
 
     for filepath in sorted(conflicting_files):
-        modified_ranges, deleted_ranges = get_conflicting_target_ranges(
-            source, target, merge_base, filepath
-        )
+        modified_ranges, deleted_ranges = get_conflicting_target_ranges(tree_sha, filepath)
         debug(f"  {filepath}: modified={modified_ranges}  deleted={deleted_ranges}")
 
         raw_commits = set()
@@ -437,14 +305,28 @@ def find_conflict_sources(source, target):
                 raw_commits.add(commit)
 
         responsible = []
+        merge_fallbacks = []
         for commit in raw_commits:
             if is_merge_commit(commit):
-                debug(f"  {commit[:8]}: skip (merge commit)")
+                if is_ancestor_of(commit, merge_base):
+                    debug(f"  {commit[:8]}: skip (merge commit, predates merge base)")
+                else:
+                    debug(f"  {commit[:8]}: defer (merge commit)")
+                    merge_fallbacks.append(commit)
             elif is_ancestor_of(commit, merge_base):
                 debug(f"  {commit[:8]}: skip (predates merge base)")
             else:
                 debug(f"  {commit[:8]}: responsible")
                 responsible.append(commit)
+
+        # If every blamed commit was a merge commit, the conflict was introduced
+        # by a conflict-resolution merge (e.g. a line written during a manual
+        # merge resolution).  Fall back to reporting those merge commits rather
+        # than silently producing no results.
+        if not responsible and merge_fallbacks:
+            for commit in merge_fallbacks:
+                debug(f"  {commit[:8]}: responsible (merge commit, no non-merge alternative)")
+            responsible = merge_fallbacks
 
         if responsible:
             results[filepath] = sorted(responsible)
