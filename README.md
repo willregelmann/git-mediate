@@ -94,3 +94,26 @@ If there are no conflicts, it prints `No conflicts found.`
 
 - Git 2.38+ (for `git merge-tree --write-tree`)
 - Python 3.6+
+
+## Development
+
+Install in editable mode so code changes take effect immediately:
+
+```bash
+pip install -e .
+```
+
+Run the test suite:
+
+```bash
+python -m unittest tests/test_git_mediate.py
+```
+
+Run a single test:
+
+```bash
+python -m unittest tests.test_git_mediate.TestGitMediate.test_simple_conflict
+```
+
+The tests create isolated, throwaway Git repositories, so they don't touch your
+global Git configuration or the working tree.
