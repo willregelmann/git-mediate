@@ -1,10 +1,12 @@
 # git-mediate
 
+[![Tests](https://github.com/willregelmann/git-mediate/actions/workflows/test.yml/badge.svg)](https://github.com/willregelmann/git-mediate/actions/workflows/test.yml)
+
 A Git extension to identify the source of merge conflicts before actually merging branches.
 
 ## Purpose
 
-`git-mediate` helps you understand the source of potential merge conflicts by identifying the specific commits on the target branch that would conflict with your current branch. This allows you to:
+`git-mediate` helps you understand the source of potential merge conflicts by identifying the specific commits in your current branch that would conflict with an incoming source branch. This allows you to:
 
 - Anticipate conflicts before merging
 - Understand which commits created the conflicting changes
@@ -13,18 +15,18 @@ A Git extension to identify the source of merge conflicts before actually mergin
 ## Installation
 
 1. Clone this repository:
-   ```
-   git clone https://github.com/yourusername/git-mediate.git
+   ```bash
+   git clone https://github.com/willregelmann/git-mediate.git
    ```
 
 2. Install using pip:
-   ```
+   ```bash
    cd git-mediate
    pip install .
    ```
 
    For development mode (changes to the code take effect immediately):
-   ```
+   ```bash
    pip install -e .
    ```
 
@@ -32,45 +34,63 @@ Git automatically detects executables with names that start with `git-` and make
 
 ## Usage
 
-```
-git mediate <target-branch>
+```bash
+git mediate <source-branch>
 ```
 
-For example, if you're on branch `feature` and want to check for conflicts with `main`:
+The argument is the branch you intend to merge **into** your current branch. For example, if you're on `feature` and want to see how merging `main` would conflict:
 
-```
+```bash
 git mediate main
 ```
 
-This will analyze potential conflicts and show you the commits in the `main` branch that would conflict with your current branch.
+This analyzes the potential merge and shows you the commits in your current branch (`feature`) that would conflict with the incoming `main` branch.
+
+You can also compare two explicit branches without checking out either of them, where commits are reported from `<target>`:
+
+```bash
+git mediate <source>..<target>
+```
+
+Add `--debug` to print verbose conflict-detection output to stderr:
+
+```bash
+git mediate --debug main
+```
 
 ## Example Output
 
-```
-Checking for conflicts between feature and main...
+```text
+Conflicting files:
+  src/api/handler.py
+  src/controller.py
 
-Update error handling in API
-Author: John Doe <john@example.com>
-Date: 2025-05-01 10:23:45
-SHA: f2fa059e406de7b61203c1c8df6fd71617b6fc18
+Commits in 'feature' responsible for conflicts:
 
 Refactor main controller
 Author: Jane Smith <jane@example.com>
-Date: 2025-05-02 14:37:22
-SHA: a8cd45f719f6ac7e4b287f98a9c9e1c83e7b5f12
+Date:   2025-05-02 14:37:22
+SHA:    a8cd45f
+
+Update error handling in API
+Author: John Doe <john@example.com>
+Date:   2025-05-01 10:23:45
+SHA:    f2fa059
 ```
+
+If there are no conflicts, it prints `No conflicts found.`
 
 ## How It Works
 
 `git-mediate` works without modifying your working directory:
 
-1. It identifies potential conflicts using Git's merge-tree command
-2. For each conflicting file, it determines which commits in the target branch 
+1. It identifies potential conflicts using Git's `merge-tree --write-tree` command
+2. For each conflicting file, it uses `git blame` to determine which commits in the target branch last modified the conflicting lines
 3. It presents this information in a clear format, showing:
    - Which commits would cause conflicts
    - When those changes were made and by whom
 
 ## Requirements
 
-- Git
+- Git 2.38+ (for `git merge-tree --write-tree`)
 - Python 3.6+

@@ -6,6 +6,8 @@ setup(
     description="A Git extension to identify the source of merge conflicts",
     author="Will Regelmann",
     author_email="will@regelmann.net",
+    license="MIT",
+    url="https://github.com/willregelmann/git-mediate",
     py_modules=["git_mediate"],
     entry_points={
         'console_scripts': [
