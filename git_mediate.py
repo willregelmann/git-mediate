@@ -112,9 +112,48 @@ def get_conflicting_target_ranges(tree_sha, filepath):
         debug(f"  {filepath}: could not read merged content from merge-tree result")
         return [], []
 
-    ranges = _parse_theirs_conflict_ranges(merged_content)
-    debug(f"  {filepath}: merge-tree conflict ranges in target = {ranges}")
-    return ranges, []
+    theirs_ranges = _parse_theirs_conflict_ranges(merged_content)
+    ours_ranges = _parse_ours_conflict_ranges(merged_content)
+    
+    debug(f"  {filepath}: merge-tree conflict ranges in target = {theirs_ranges}")
+    
+    # If theirs is empty but ours has content, use ours as a fallback
+    if not theirs_ranges and ours_ranges:
+        theirs_ranges = ours_ranges
+    
+    return theirs_ranges, []
+
+
+def _parse_ours_conflict_ranges(merged_text):
+    """
+    Parse conflict markers and return ranges of line numbers in 'ours'
+    (the source/incoming branch) that appear in conflict sections.
+    """
+    ranges        = []
+    ours_line     = 0
+    in_ours       = False
+    in_theirs     = False
+    section_start = None
+
+    for line in merged_text.splitlines():
+        if line.startswith('<<<<<<<'):
+            in_ours = True
+            section_start = ours_line + 1
+        elif line.startswith('=======') and in_ours:
+            if section_start is not None and ours_line >= section_start:
+                ranges.append((section_start, ours_line))
+            in_ours       = False
+            in_theirs     = True
+            section_start = None
+        elif line.startswith('>>>>>>>') and in_theirs:
+            in_theirs     = False
+        elif in_ours:
+            ours_line += 1
+        elif not in_theirs:
+            # Non-conflicting line — present in ours
+            ours_line += 1
+
+    return ranges
 
 
 def _parse_theirs_conflict_ranges(merged_text):

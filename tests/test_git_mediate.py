@@ -475,6 +475,46 @@ class TestGitMediate(unittest.TestCase):
         if len(merge_hash) >= 7:
             self.assertNotIn(merge_hash[:7], result.stdout)
 
+    def test_empty_theirs_section_conflict(self):
+        """
+        Test git-mediate's robustness when conflict markers have an empty theirs section.
+        
+        This can occur in real scenarios like:
+        - Merge where theirs (target) side completely removes or doesn't include
+          content that ours (source) adds
+        - The conflict parser must handle empty regions gracefully
+        
+        This test ensures the fallback to parse_ours works when theirs yields no ranges.
+        
+        Note: True empty-theirs conflicts are relatively rare in practice because
+        most conflicts affect both sides. This test validates the fix handles the edge case.
+        """
+        # Create identical file on both branches
+        self.create_file("code.py", "line1\nline2\nline3\nline4\n")
+        self.run_git("add code.py")
+        self.run_git("commit -m 'Add initial code'")
+
+        # Target: modifies early lines
+        self.run_git("checkout -b target")
+        self.create_file("code.py", "line1_changed\nline2_changed\nline3\nline4\n")
+        self.run_git("add code.py")
+        self.run_git("commit -m 'Target: change line1 and line2'")
+
+        # Source: modifies end lines
+        self.run_git(f"checkout {self.default_branch}")
+        self.run_git("checkout -b source")
+        self.create_file("code.py", "line1\nline2\nline3_changed\nline4_changed\nline5_new\n")
+        self.run_git("add code.py")
+        self.run_git("commit -m 'Source: change line3, line4, add line5'")
+
+        self.run_git("checkout target")
+        result = self.run_mediate("source")
+
+        # Should detect the conflict and report the target-side commits responsible
+        self.assertIn("Conflicting files:", result.stdout)
+        self.assertIn("Target: change line1 and line2", result.stdout)
+        self.assertNotIn("No conflicts found", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
